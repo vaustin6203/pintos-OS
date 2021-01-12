@@ -1,0 +1,173 @@
+Synchronization
+We have to consider the data race case where there could be more than one thread reading and writing to an inode at the same time. Since all threads share the same underlying inode structures, we must synchronize access to inodes whenever a thread wants to read or write to/from one. We accomplish this by adding a lock to our inode structure. Whenever we want to read or write to an inode, we acquire the inode’s lock and release it when we are done. Our design considers consecutive writes to the same inode a data race, consecutive read and write to the same inode a data race, and consecutive reads to the same inode a data race. We chose to make the last case a data race since we want to be able to synchronize the position that the inode points to in the file after a read. 
+    
+Rationale
+Before, we had considered FFS where we only allocate enough blocks to create a path to wherever we wanted to write. However, that could result in gaps in the file system, where a sufficiently large read will try to read unallocated blocks between allocated blocks. Instead, we decided to allocate blocks for an entire level whenever we need to extend a file to a given level and fill all the allocated memory with zeros. One of our original ideas was to have a single block_sector_t in our inode_disk and write the address of the previous level in the first entry in the block and traverse down the tree this way to reach lower levels. We realized things would be a lot more straightforward if we just stuck to the original Berkeley FFs scheme shown in lecture with 3 seperate pointers in the inode_disk for the direct, indirect, and doubly_indirect levels. 
+
+Task 3: Subdirectories
+Data structures and functions
+Modifying thread struct in thread.c to have a list of open file and a list of open directories. We also are adding the current working directory of a thread as a parameter. 
+Struct thread {
+    Struct list open_files;
+    Struct list open_dirs;
+    Struct dir *cwd;
+};
+
+Adding a list_elem to file struct in file.c so can be added to a thread’s open list of files. Also adding the file descriptor for the file.
+struct file {
+  struct list_elem elem;
+  int fd;
+  };
+
+Adding a list_elem to directory struct in directory.c so can be added to a thread’s open list of directories. Also adding the file descriptor for the directory. 
+Struct directory {
+    Struct list_elem directory_elem;
+    Int fd;
+}
+
+Before in project 1 we had a global array of open files in our syscall.c. Now we will have a global array of open files and a global array of open directories. We will also have a global lock for the file array and a global lock for the directory array since these are shared data structures that we need to make critical sections whenever reading or writing from them. We are removing the global lock we had in syscall.c for all file operations that we had in project #1. 
+
+In addition to the global openfiles array, there will also be a global opendir array. Keeping the two arrays separate prevents any misunderstandings, where a file call might take in a directory, or a directory call takes a file. It will be in syscall.c, along with the openfile array.
+dir * opendir[MAX_FD]
+
+Modified functions:
+/**must be able to open files and directories */
+    Open syscall
+    
+    /**must be able to support open files and directories */
+    Close syscall 
+    
+    /**deletes empty directories that are not open in any thread and deletes files */
+    Remove syscall
+
+    /**must be able to open files in the proper directory since files can be in nested     **directories now */
+    Filesys_open in filesys.c
+
+New functions:
+/*** given a “char **path” and a “char *target” it will store the file_name/ or directory in the ***  “*target” and the “**path” now points to absolute path. Return true if it is a directory and false if it is a file**/
+Bool is_directory(char **path, char *target);
+
+/*** given a “char *name” it finds the directory for it and opens the right directory.**/
+Dir *file_sys_dir_open(const char *name);
+
+/**allocates a new block sector from disk that is free and returns its address */
+Block_sector_t next_available_sector(int size);
+
+get_next_part (char part[NAME_MAX + 1], const char **srcp);
+
+chdir, mkdir, readdir, and isdir
+
+Algorithms
+1. How will your file system take a relative path like../my_files/notes.txt and locate the corre-sponding directory? Also, how will you locate absolute paths like/cs162/solutions.md?
+Call is is_directory(path,buffer) it should return false and store notes.txt in buffer and the new path should be ../my_files/. Now we can use the “CWD” and trim current_folder name from it and append /my_files/ to it. After that we will open all directories in the new path and once we open all of that we will open the notes.txt in that directory.
+
+2. Will a user process be allowed to delete a directory if it is the cwd of a running process? The testsuite will accept both “yes’ and “no”, but in either case, you must make sure that new files cannot be created in deleted directories.
+WE will not allow it. So if someone wanted to create a file in there it is okay. When we delete a directory we will make sure it’s num_count is not larger than 1 before deleting it.
+
+
+3.How will your system call handlers take a file descriptor, like 3, and locate the corresponding file or directory struct?
+It will scan either the file list or the directory list, depending on what syscall called it. This way, there will be no mistaking a file for a directory, since if an fd corresponds to both a file and a directory, the caller will always check the right list for it. 
+
+case SYS_OPEN:
+{
+Do the required validation for the argument, which is a string that may be a file or a dir.
+Do NOT require the lock anymore, since there is no more global file lock.
+We try two cases: First, check if there is a forward slash in the argument. If so, then it is a directory. If not, it is a file. In the case that it is a file, proceed as normal with the code from project 1.
+If it is a directory, call file_sys_dir_open(args[1]). If file_sys_dir_open returns a valid directory pointer, stick the pointer in the global list of open directories.
+}
+
+Case SYS_CLOSE:
+{
+    Call is_directory on the given “path” and with a argument target
+    Return of is_directory determines if it is a file or directory.
+    If it is a file:
+        Open all the directories in the path
+Find the associated file with the name target
+        Call file_close(target_file)
+    If it is a directory:
+        Open all the directories in the path 
+Find the associated directory with name target
+        Call dir_close(target_dir);
+}
+
+Case SYS_REMOVE:
+{
+    Call is_directory on the given “path” and with a argument target
+    Return of is_directory determines if it is a file or directory.
+    If it is a file:
+        Open all the directories in the path
+Find the associated file with the name target
+If it's open_count==0:
+    Call file_remove(taget_file, target);
+Else:
+    Just return::: this was a design choice.
+        
+    If it is a directory:
+        Open all the directories in the path 
+Find the associated directory with name target
+        If it's open_count ==0 and number_of_entries == 0:
+            Call dir_remove(target_dir, target)
+        Else:
+            Just return ::::: this was a design choice.
+
+
+}
+
+Case SYS_READDIR:
+{
+Given the “int fd” and “char *name”. we find if the Global dir_array has any directory in the index fd. dir = dir_array[fd]
+If dir == NULL:
+ return false
+Else:
+    Return  dir_read_dir(dir,name);
+:
+}
+
+filesys_diropen(const char *name) {
+Struct dir curr_dir = thread_current()->curr_directory;
+    Struct inode *inode = NULL;
+    If (curr_dir != NULL) {
+        dir_lookup(curr_dir, name, inode);
+    }
+    Return dir_open(inode);
+}
+
+bool chdir (const char *dir) {
+Resolve dir path using is_dir func 
+If path not found return false;
+thread_current()->curr_dir = dir;
+Return true; 
+}
+
+Block_sector_t next_available_sector(int size) {
+    Block_sector_t block; 
+    Size_t cnt = bytes_to_sectors(size);
+    free_map_allocate(cnt, &block);
+Return block;
+    
+bool mkdir (const char *dir) {
+Resolve dir path using is_dir func
+If path does not exist return false;
+Get parent directory of dir and open it to get its dir struct 
+Block_sector_t sector = next_available_sector(0)
+dir_create(sector, 0);
+Struct inode inode = inode_open(sector);
+dir_add(parent_dir, dir, inode->sector)
+free_map_release(sector, 0);
+Return true; 
+}
+
+Synchronization
+We will no longer have a global lock on all file related syscalls. Instead, each inode has its own lock, which will ensure no more than one thread can read or write to the same inode at any given point. We will also have a lock for our global file array and use it to make critical sections whenever we are reading or writing to that array. We will also have a lock for our global directory array. This way, independent operations can issue I/O operations concurrently, but prevents data races from occurring when two dependent operations try to run concurrently. 
+
+Rationale
+We didn’t really come up with any alternative designs for task #3. We worked really hard to flesh out the details originally, and as we went through everything, we didn’t find any holes in our original design. 
+
+Additional Question:
+For this project, there are 2 optional buffer cache features that you can implement: write-behind and read-ahead. A buffer cache with write-behind will periodically flush dirty blocks to the file system block device, so that if a power outage occurs, the system will not lose as much data. Without write-behind, a write-back cache only needs to write data to disk when (1) the data is dirty and gets evicted from the cache, or (2) the system shuts down. A cache with read-ahead will predict which block the system will need next and fetch it in the background. A read-ahead cache can greatly improve the performance of sequential file reads and other easily-predictable file access patterns. Please discuss a possible implementation strategy for write-behind and a strategy for read-ahead. You must answer this question regardless of whether you actually decide to implement these features. 
+&p, we can periodically implement write-behind such that it flushes dirty blocks, but does not delete them from the cache. We could create a thread that does nothing but sleep for a certain number of minutes, and then wakes up. This thread would go through each entry in the cache and write back atomically. That is to say, it would call cond_wait on the entry’s condition variable, flush the data if it is dirty, call cond_signal, and continue to the next entry.
+For read_ahead, we could predict that the next block that the program will want will be the next sequential block from the one that we just fetched. In this way, whenever we go to disk, we would not only read the block that is in question but also the next sequential block, since it is likely this block is in the working set of the program and will want to be accessed soon. 
+
+Questions for Jonathon:
+ How do we, for indirect and doubly indirect pointers, traverse the list down to the direct blocks and zero them?
+
